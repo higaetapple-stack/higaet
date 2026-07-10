@@ -4,11 +4,17 @@ name: Unified Deploy
 # push, so it cannot race with other deploy workflows.
 #
 # Pipeline:
-#   build (this file) → produces `dist` artifact for the exact commit SHA
-#   deploy (_deploy-kernel.yml) → consumes `dist` artifact, rsyncs to MilesWeb
+#   build (_ci-kernel.yml)   → produces the `dist` artifact for this SHA
+#     - Runs BUILD_TARGET=node so Nitro emits .output/server/index.mjs
+#     - Uploads .output, app.js, package.json, package-lock.json, scripts
+#       under artifact name `dist` (the kernel's default upload set).
+#   deploy (_deploy-kernel.yml) → consumes `dist`, rsyncs to MilesWeb
 #
-# Building inside this workflow (not reusing an old CI artifact) guarantees
-# the deployed release matches the dispatched commit.
+# Build-once contract (ci-integrity-guard.yml):
+#   Only _ci-kernel.yml is allowed to run `npm|bun|pnpm|yarn run build`.
+#   This orchestrator MUST NOT invoke a build step itself — it delegates to
+#   the reusable CI kernel and passes the resulting artifact straight into
+#   the deploy kernel.
 
 on:
   workflow_dispatch:
@@ -32,68 +38,19 @@ permissions:
 
 jobs:
   build:
-    name: Build (dist artifact)
-    runs-on: ubuntu-latest
-    # brevo target is a stub in the kernel — skip artifact production
+    name: Build (dist artifact via CI kernel)
+    # brevo target is a stub in the deploy kernel — skip artifact production
     if: inputs.target != 'brevo'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js 22
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22.x
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build (Nitro node-server preset)
-        env:
-          BUILD_TARGET: node
-        run: npm run build:node
-
-      - name: Assemble dist/
-        run: |
-          set -e
-          rm -rf dist
-          mkdir -p dist
-          cp -R .output dist/.output
-          cp app.js dist/app.js
-          cp package.json dist/package.json
-          cp package-lock.json dist/package-lock.json
-          cp -R scripts dist/scripts
-          echo "dist assembled:"
-          find dist -maxdepth 2 -type d
-
-      - name: Validate dist artifact
-        run: |
-          set -e
-          FAIL=0
-          for f in dist/.output/server/index.mjs dist/app.js dist/package.json dist/package-lock.json; do
-            if [ ! -f "$f" ]; then
-              echo "::error::Missing required artifact file: $f"
-              FAIL=1
-            fi
-          done
-          if [ ! -d dist/scripts ] || [ -z "$(ls -A dist/scripts)" ]; then
-            echo "::error::dist/scripts missing or empty"
-            FAIL=1
-          fi
-          if [ "$FAIL" -eq 1 ]; then
-            echo "::error::Artifact validation failed — refusing to upload"
-            exit 1
-          fi
-          echo "::notice::dist artifact validated ($(find dist -type f | wc -l) files)"
-
-      - name: Upload dist artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
-          if-no-files-found: error
-          retention-days: 7
+    uses: ./.github/workflows/_ci-kernel.yml
+    with:
+      node-version: "22"
+      run-lint: false
+      run-typecheck: false
+      run-build: true
+      upload-artifact: true
+      artifact-name: dist
+      build-target: node
+    secrets: inherit
 
   deploy:
     name: Deploy (${{ inputs.target }})

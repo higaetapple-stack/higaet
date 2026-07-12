@@ -58,7 +58,8 @@ jobs:
           VITE_SENTRY_ENV: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
           VITE_GIT_COMMIT_SHA: ${{ github.sha }}
           GIT_COMMIT_SHA: ${{ github.sha }}
-        run: bun run build:node
+        # Build handled by _ci-kernel.yml (build-once contract)
+# This workflow consumes the generated artifact instead of rebuilding.
 
       # Hard artifact guard: if the build didn't produce dist/ we must NOT
       # continue to sentry-cli — that would silently upload nothing and

@@ -64,7 +64,8 @@ jobs:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
           VITE_SUPABASE_PROJECT_ID: ${{ secrets.VITE_SUPABASE_PROJECT_ID }}
-        run: bun run build 2>&1 | tee legacy-build.log
+        # Build is handled by _ci-kernel.yml (build-once contract)
+# This workflow must consume the artifact instead of rebuilding.
 
       - name: Upload legacy logs
         if: always()

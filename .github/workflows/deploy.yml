@@ -1,12 +1,20 @@
 name: Unified Deploy
 
 # P4 unified deploy orchestrator. workflow_dispatch ONLY — never triggers on
-# push, so it cannot race with the existing deploy-milesweb / brevo
-# workflows during shadow-mode cutover.
+# push, so it cannot race with other deploy workflows.
 #
-# Delegates to _deploy-kernel.yml (currently a dry-run stub — see that file).
-# Once the kernel absorbs real deploy logic, this orchestrator does not need
-# to change.
+# Pipeline:
+#   build (_ci-kernel.yml)   → produces the `dist` artifact for this SHA
+#     - Runs BUILD_TARGET=node so Nitro emits .output/server/index.mjs
+#     - Uploads .output, app.js, package.json, package-lock.json, scripts
+#       under artifact name `dist` (the kernel's default upload set).
+#   deploy (_deploy-kernel.yml) → consumes `dist`, rsyncs to MilesWeb
+#
+# Build-once contract (ci-integrity-guard.yml):
+#   Only _ci-kernel.yml is allowed to run `npm|bun|pnpm|yarn run build`.
+#   This orchestrator MUST NOT invoke a build step itself — it delegates to
+#   the reusable CI kernel and passes the resulting artifact straight into
+#   the deploy kernel.
 
 on:
   workflow_dispatch:
@@ -29,9 +37,28 @@ permissions:
   contents: read
 
 jobs:
+  build:
+    name: Build (dist artifact via CI kernel)
+    # brevo target is a stub in the deploy kernel — skip artifact production
+    if: inputs.target != 'brevo'
+    uses: ./.github/workflows/_ci-kernel.yml
+    with:
+      node-version: "22"
+      run-lint: false
+      run-typecheck: false
+      run-build: true
+      upload-artifact: true
+      artifact-name: dist
+      build-target: node
+    secrets: inherit
+
   deploy:
     name: Deploy (${{ inputs.target }})
+    needs: build
+    # brevo skips build; kernel handles the stub itself
+    if: always() && (inputs.target == 'brevo' || needs.build.result == 'success')
     uses: ./.github/workflows/_deploy-kernel.yml
     with:
       target: ${{ inputs.target }}
+      artifact_name: dist
     secrets: inherit

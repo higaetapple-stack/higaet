@@ -76,7 +76,7 @@ jobs:
 
             builds=false
             downloads=false
-            if echo "$stripped" | grep -Eq '(bun|npm|pnpm|yarn)[[:space:]]+run[[:space:]]+build'; then
+            if echo "$stripped" | grep -Eq '(bun|npm|pnpm|yarn)[[:space:]]+run[[:space:]]+build(:[a-zA-Z0-9_-]+)?'; then
               builds=true
             fi
             if echo "$stripped" | grep -Eq 'actions/download-artifact@'; then

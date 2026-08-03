@@ -45,14 +45,17 @@ on:
         required: false
         default: "ci-build"
       build-command:
+        # Canonical production build. Node SSR (Nitro node-server) is the ONLY
+        # supported production runtime — never override this with a plain
+        # `npm run build`, which can emit a Cloudflare Workers bundle.
         type: string
         required: false
-        default: "bun run build"
+        default: "npm run build:node"
       build-target:
-        description: "Passed as BUILD_TARGET env to the build step (e.g. 'node' for Nitro node-server preset)."
+        description: "Passed as BUILD_TARGET env to the build step. 'node' selects the Nitro node-server preset (canonical production target)."
         type: string
         required: false
-        default: ""
+        default: "node"
       # P4 shadow-mode routing hint. Callers (ci.yml matrix) pass
       # "core" | "seo" | "security". Default "core" preserves existing
       # behavior for every existing caller — no behavior change.
@@ -78,60 +81,173 @@ jobs:
 
 
       - name: Setup toolchain
-        uses: ./.github/actions/setup-node-bun
+        uses: ./.github/actions/setup-node
         with:
           node-version: ${{ inputs.node-version }}
 
+      # HARD GATE: if `npm ci` failed (e.g. package-lock.json out of sync with
+      # package.json), node_modules/.bin is empty and every later step dies
+      # with exit 127 ("vite: command not found"), masking the real cause.
+      - name: Verify install
+        run: |
+          if [ ! -x node_modules/.bin/vite ]; then
+            echo "::error::Dependencies are not installed (node_modules/.bin/vite missing)."
+            echo "This usually means 'npm ci' failed because package-lock.json is out of"
+            echo "sync with package.json. Run 'npm install --package-lock-only' and commit."
+            exit 1
+          fi
+          echo "vite: $(node_modules/.bin/vite --version)"
+
+      - name: Lockfile sync check
+        run: node scripts/check-lockfile-sync.mjs || true
+
       - name: Lint
         if: ${{ inputs.run-lint }}
-        run: bun run lint 2>&1 | tee lint.log
+        run: npm run lint 2>&1 | tee lint.log
 
       - name: Typecheck
-        if: ${{ inputs.run-typecheck && always() }}
-        run: bun run typecheck 2>&1 | tee typecheck.log
+        if: ${{ inputs.run-typecheck }}
+        run: npm run typecheck 2>&1 | tee typecheck.log
 
       - name: Build
-        if: ${{ inputs.run-build && always() }}
+        if: ${{ inputs.run-build }}
+
         env:
           NODE_OPTIONS: "--max-old-space-size=6144"
           BUILD_TARGET: ${{ inputs.build-target }}
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
           VITE_SUPABASE_PROJECT_ID: ${{ secrets.VITE_SUPABASE_PROJECT_ID }}
-        run: ${{ inputs.build-command }} 2>&1 | tee build.log
+        run: |
+          BUILD_STARTED_AT=$(date -u +%s)
+          ${{ inputs.build-command }} 2>&1 | tee build.log
+          STATUS=${PIPESTATUS[0]}
+          echo "BUILD_DURATION_MS=$(( ( $(date -u +%s) - BUILD_STARTED_AT ) * 1000 ))" >> "$GITHUB_ENV"
+          exit "$STATUS"
 
       - name: Artifact check
-        if: ${{ inputs.run-build && always() }}
+        if: ${{ inputs.run-build }}
         run: |
-          if [ ! -d dist ] && [ ! -d .output ]; then
-            echo "::error::Build produced neither dist/ nor .output/"
+          if [ ! -d .output ]; then
+            echo "::error::Build produced no .output/ — Nitro did not run with the node-server preset"
             exit 1
           fi
           if [ "${{ inputs.build-target }}" = "node" ]; then
+            node scripts/verify-node-build.mjs
             if [ ! -f .output/server/index.mjs ]; then
               echo "::error::Node build target selected but .output/server/index.mjs is missing"
               exit 1
             fi
-            echo "Node server bundle OK: $(ls -la .output/server/index.mjs)"
+            SIZE=$(wc -c < .output/server/index.mjs | tr -d ' ')
+            if [ "$SIZE" -lt "1024" ]; then
+              echo "::error::.output/server/index.mjs is present but suspiciously small (${SIZE} bytes) — Nitro build likely failed"
+              exit 1
+            fi
+            echo "Node server bundle OK: $(ls -la .output/server/index.mjs) (${SIZE} bytes)"
           fi
+
+      - name: Build summary
+        if: ${{ inputs.run-build }}
+        run: |
+          {
+            echo "### Build — ${{ inputs.build-target }}"
+            echo ""
+            echo "- Build duration: ${BUILD_DURATION_MS:-unknown} ms"
+            if [ -f .output/server/index.mjs ]; then
+              echo "- Server bundle: $(wc -c < .output/server/index.mjs | tr -d ' ') bytes"
+            fi
+            if [ -f .output/build-manifest.json ]; then
+              echo ""
+              echo '```json'
+              cat .output/build-manifest.json
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify build manifest
+        if: ${{ inputs.run-build && inputs.build-target == 'node' }}
+        run: |
+          if [ ! -f .output/build-manifest.json ]; then
+            echo "::error::.output/build-manifest.json missing — postbuild:node did not run scripts/generate-build-manifest.mjs"
+            exit 1
+          fi
+          PRESET=$(node -p "require('./.output/build-manifest.json').build.nitroPreset")
+          if [ "$PRESET" != "node-server" ]; then
+            echo "::error::Build manifest reports nitro preset '$PRESET' — production requires 'node-server'"
+            exit 1
+          fi
+          echo "::notice::Build manifest verified (preset=$PRESET)"
+          cat .output/build-manifest.json
+
+      - name: Generate artifact manifest
+        if: ${{ inputs.run-build && inputs.build-target == 'node' }}
+        run: |
+          MANIFEST=".output/manifest.json"
+          {
+            echo "{"
+            echo "  \"generatedAt\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+            echo "  \"gitSha\": \"${GITHUB_SHA}\","
+            echo "  \"gitRef\": \"${GITHUB_REF}\","
+            echo "  \"runId\": \"${GITHUB_RUN_ID}\","
+            echo "  \"buildTarget\": \"${{ inputs.build-target }}\","
+            echo "  \"nodeVersion\": \"$(node -v)\","
+            echo "  \"serverEntry\": {"
+            echo "    \"path\": \".output/server/index.mjs\","
+            echo "    \"exists\": $( [ -f .output/server/index.mjs ] && echo true || echo false ),"
+            echo "    \"sizeBytes\": $( [ -f .output/server/index.mjs ] && wc -c < .output/server/index.mjs | tr -d ' ' || echo 0 ),"
+            echo "    \"sha256\": \"$( [ -f .output/server/index.mjs ] && sha256sum .output/server/index.mjs | cut -d' ' -f1 || echo missing )\""
+            echo "  },"
+            echo "  \"publicAssets\": $( [ -d .output/public ] && find .output/public -type f | wc -l | tr -d ' ' || echo 0 ),"
+            echo "  \"totalFiles\": $(find .output -type f | wc -l | tr -d ' ')"
+            echo "}"
+          } > "$MANIFEST"
+          echo "::notice::Artifact manifest:"
+          cat "$MANIFEST"
+          # Hard gate — abort if server entry missing or empty
+          if [ ! -s .output/server/index.mjs ]; then
+            echo "::error::Manifest check failed — .output/server/index.mjs missing or empty"
+            exit 1
+          fi
+
+      # Small, standalone artifact holding ONLY the two files that prove a
+      # successful canonical Node SSR build. Uploaded on every successful
+      # build so they can be downloaded/inspected without pulling the full
+      # multi-MB release payload below.
+      - name: Upload Node SSR artifacts (server bundle + manifest)
+        if: ${{ inputs.run-build && inputs.build-target == 'node' && success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}-node-ssr
+          path: |
+            .output/server/index.mjs
+            .output/build-manifest.json
+          # `.output` is dot-prefixed and excluded by upload-artifact v4 default.
+          include-hidden-files: true
+          retention-days: 14
+          if-no-files-found: error
+
 
       - name: Upload build artifact
         if: ${{ inputs.upload-artifact && inputs.run-build && success() }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact-name }}
-          # TanStack Start + Nitro emits `.output/` (server + public). We
-          # keep `dist` as a fallback for callers that still produce it.
-          # Passenger release also needs app.js + package manifests +
-          # scripts/ (predeploy validation, smoke tests) at release root.
+          # Canonical Node SSR release payload. Nitro emits `.output/`
+          # (server + public); Passenger additionally needs app.js, the npm
+          # manifests (`npm ci --omit=dev` on the host) and scripts/.
+          # `dist/` (Cloudflare/browser-only output) and bun.lock are
+          # deliberately NOT shipped to production.
           path: |
             .output
-            dist
             app.js
             package.json
             package-lock.json
-            bun.lock
+            .npmrc
             scripts
+          # actions/upload-artifact v4 excludes dot-prefixed paths by default.
+          # Nitro's complete Node server bundle lives under `.output/`, so this
+          # must be enabled or the uploaded artifact silently omits index.mjs.
+          include-hidden-files: true
           retention-days: 3
           if-no-files-found: warn
 
